@@ -1,4 +1,4 @@
-name: Build with Nuitka on Windows
+name: Build
 
 on:
   workflow_dispatch:        # 手动触发
