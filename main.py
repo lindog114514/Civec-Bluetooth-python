@@ -7,15 +7,11 @@ from bleak.exc import BleakError
 
 # 设备信息
 TARGET_NAME = "47L124000"
-SERVICE_UUID = "0000180c-0000-1000-8000-00805f9b34fb"
 CHAR_WRITE_UUID = "0000150a-0000-1000-8000-00805f9b34fb"   # 写特征
-CHAR_NOTIFY_UUID = "0000150b-0000-1000-8000-00805f9b34fb"  # 通知特征
-
-# 重置气压指令 (66 指令，12字节)
-RESET_PRESSURE_CMD = bytes.fromhex("660000000000000000000002")
+CHAR_NOTIFY_UUID = "0000150b-0000-1000-8000-00805f9b34fb"  # 通知特征（接收气压数据）
 
 # 开启气压上报指令 (B0 指令，17字节)
-START_REPORT_CMD = bytes.fromhex("B001D064" + "00" * 13)   # 指示灯颜色 01，启动上报 D0，固定 64
+B0_CMD = bytes.fromhex("B001D064" + "00" * 13)   # 指示灯颜色 01，启动上报 D0，固定 64
 
 def parse_pressure(data: bytearray) -> float:
     """解析气压数据，返回气压值（kPa）"""
@@ -62,19 +58,14 @@ async def main():
     async with BleakClient(device) as client:
         print("已连接")
 
-        # 3. 先重置气压读值
-        print("正在重置气压值...")
-        await client.write_gatt_char(CHAR_WRITE_UUID, RESET_PRESSURE_CMD, response=False)
-        await asyncio.sleep(0.2)  # 稍作等待，确保指令执行
-
-        # 4. 再开启气压上报
-        print("正在开启气压上报...")
-        await client.write_gatt_char(CHAR_WRITE_UUID, START_REPORT_CMD, response=False)
-        await asyncio.sleep(0.2)
-
-        # 5. 启用通知特征
+        # 3. 先启用 Notify（监听 0x150B）
         await client.start_notify(CHAR_NOTIFY_UUID, notification_handler)
-        print("已开启气压通知，实时显示数据（按 Ctrl+C 停止）")
+        print("已开启气压通知监听")
+
+        # 4. 再发送 B0 指令（写入 0x150A）
+        print("正在发送 B0 指令，启动主动上报...")
+        await client.write_gatt_char(CHAR_WRITE_UUID, B0_CMD, response=False)
+        print("B0 指令已发送，等待接收气压数据...（按 Ctrl+C 停止）")
 
         try:
             while True:
