@@ -1,77 +1,104 @@
 print("本程序没有经过实物测试如果有任何问题请联系qq:1936219518")
 print("")
 import asyncio
-import struct
-from bleak import BleakScanner, BleakClient
-from bleak.exc import BleakError
+import sys
+from bleak import BleakScanner, BleakClient, BleakError
 
-# 设备信息
-TARGET_NAME = "47L124000"
-CHAR_WRITE_UUID = "0000150a-0000-1000-8000-00805f9b34fb"   # 写特征
-CHAR_NOTIFY_UUID = "0000150b-0000-1000-8000-00805f9b34fb"  # 通知特征（接收气压数据）
+# 设备名称（根据文档）
+DEVICE_NAME = "47L124000"
+# 服务与特征 UUID（基于文档提供的基础 UUID）
+SERVICE_UUID = "0000180c-0000-1000-8000-00805f9b34fb"
+CHAR_WRITE_UUID = "0000150a-0000-1000-8000-00805f9b34fb"  # 写入指令
+CHAR_NOTIFY_UUID = "0000150b-0000-1000-8000-00805f9b34fb"  # 接收数据
 
-# 开启气压上报指令 (B0 指令，17字节)
-B0_CMD = bytes.fromhex("B001D064" + "00" * 13)   # 指示灯颜色 01，启动上报 D0，固定 64
+# B0 指令：开启气压主动上报
+# 格式: 0xB0 + 0x01(指示灯颜色) + 0xD0(启动上报) + 0x64(固定) + 13 字节 0x00
+B0_CMD = bytes([0xB0, 0x01, 0xD0, 0x64] + [0x00] * 13)
 
-def parse_pressure(data: bytearray) -> float:
-    """解析气压数据，返回气压值（kPa）"""
-    if len(data) < 11:
-        return None
-    # 气压值位于第9、10字节（小端序有符号短整型）
-    pressure_bytes = data[9:11]
-    raw = struct.unpack("<h", pressure_bytes)[0]
-    return raw / 100.0
 
-async def notification_handler(sender, data: bytearray):
-    """气压通知回调"""
+def parse_pressure(data: bytes) -> float | None:
+    """
+    从 17 字节的 D0 消息中提取气压值。
+    文档示例中气压字段位于消息的第 9、10 字节（索引 8、9，substring(18,22)）。
+    小端序 int16，除以 100 得到 kPa。
+    """
+    if len(data) >= 11 and data[0] == 0xD0:
+        # 取索引 9,10 两个字节
+        pressure_bytes = data[9:11]
+        value = int.from_bytes(pressure_bytes, byteorder="little", signed=True) / 100.0
+        return value
+    return None
+
+
+def notification_handler(sender, data: bytes):
+    """处理来自 0x150B 的通知数据"""
     pressure = parse_pressure(data)
     if pressure is not None:
-        print(f"实时气压: {pressure:.2f} kPa")
+        print(f"气压值: {pressure:.2f} kPa")
 
-async def check_bluetooth_available():
-    """检查蓝牙是否可用"""
-    try:
-        await BleakScanner.discover(timeout=2.0)
-    except BleakError as e:
-        raise RuntimeError("蓝牙未开启或不可用，请开启蓝牙后重试。") from e
-    except Exception as e:
-        raise RuntimeError(f"蓝牙检查失败: {e}") from e
 
 async def main():
-    # 1. 检查蓝牙状态
-    print("正在检查蓝牙状态...")
+    # 1. 扫描设备，若蓝牙未开启会抛出异常
+    print("正在扫描蓝牙设备……")
     try:
-        await check_bluetooth_available()
-    except RuntimeError as e:
-        print(f"错误: {e}")
+        device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=10.0)
+    except BleakError as e:
+        print(f"蓝牙错误: {e}")
+        print("请确认蓝牙适配器已开启，并且系统蓝牙功能正常。")
         return
-    print("蓝牙状态正常。")
+    except Exception as e:
+        # 某些系统可能抛出 OSError 等，也按蓝牙未开启处理
+        if "bluetooth" in str(e).lower() or "adapter" in str(e).lower():
+            print("蓝牙适配器未开启，请先打开蓝牙。")
+        else:
+            print(f"扫描时发生错误: {e}")
+        return
 
-    # 2. 扫描设备
-    print("正在扫描设备...")
-    device = await BleakScanner.find_device_by_name(TARGET_NAME, timeout=10.0)
     if device is None:
-        print(f"未找到设备 {TARGET_NAME}")
+        print(f"未找到设备 '{DEVICE_NAME}'。请检查：")
+        print("  - 设备是否已开机；")
+        print("  - 蓝牙图标是否为黄色（连按 5 次开机键可进入可被发现状态）；")
+        print("  - 设备是否在有效范围内。")
         return
 
-    print(f"找到设备: {device.name} ({device.address})")
-    async with BleakClient(device) as client:
-        print("已连接")
+    print(f"发现设备: {device.name} ({device.address})")
 
-        # 3. 先启用 Notify（监听 0x150B）
-        await client.start_notify(CHAR_NOTIFY_UUID, notification_handler)
-        print("已开启气压通知监听")
+    # 2. 连接设备并订阅通知、发送指令
+    try:
+        async with BleakClient(device) as client:
+            print("已连接，正在监听气压数据……")
 
-        # 4. 再发送 B0 指令（写入 0x150A）
-        print("正在发送 B0 指令，启动主动上报...")
-        await client.write_gatt_char(CHAR_WRITE_UUID, B0_CMD, response=False)
-        print("B0 指令已发送，等待接收气压数据...（按 Ctrl+C 停止）")
+            # 订阅 0x150B 通知（必须先监听再发指令）
+            await client.start_notify(CHAR_NOTIFY_UUID, notification_handler)
+            print("已开启通知监听。")
 
-        try:
-            while True:
-                await asyncio.sleep(1)
-        except KeyboardInterrupt:
-            print("\n停止接收。")
+            # 发送 B0 指令，启动气压上报（写 0x150A 特征）
+            # 文档未明确是否需要 response，此处先尝试无响应写入
+            await client.write_gatt_char(CHAR_WRITE_UUID, B0_CMD, response=False)
+            print("已发送 B0 启动指令，等待气压数据……")
+
+            # 持续运行，直到用户按下 Ctrl+C
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except KeyboardInterrupt:
+                print("\n用户中断，正在退出……")
+
+    except BleakError as e:
+        print(f"连接或通信错误: {e}")
+    except Exception as e:
+        print(f"未知错误: {e}")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Windows 下需要设置事件循环策略（Python 3.8+）
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"\n程序发生未预期的错误: {e}")
+    finally:
+        # 保留窗口，等待用户按键后退出
+        input("\n按回车键退出...")
